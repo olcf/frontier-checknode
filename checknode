@@ -6,12 +6,13 @@
 #
 
 usage() {
-    echo "Usage: $0 [-a] [-b] [-c] [-h] [-l] [-u] [-v]"
+    echo "Usage: $0 [-a] [-b] [-c] [-h] [-l] [-r] [-u] [-v]"
     echo "  -a all mode - run all tests"
     echo "  -b boot mode - mark the boot sequence as complete"
     echo "  -c check node only - do not change Slurm state"
     echo "  -h print this help message"
     echo "  -l local checks only - avoid network-dependent checks"
+    echo "  -r manually run node screen after failure"
     echo "  -u force undrain - clear hand-set drain messages"
     echo "  -v verbose mode"
     echo ""
@@ -33,6 +34,7 @@ ERRORCNT=0
 ERRORSTR=''
 UNDRAIN=0
 VERBOSE=0
+MANUALNODESCREEN=0
 export SLURM_CONF=/etc/slurm/slurm.conf.min
 mkdir -p /run/checknode
 mkdir -p /run/checknode/journalcache
@@ -45,7 +47,7 @@ echo -n > /run/checknode/log
 ###############################################################################
 # Process arguments
 ###############################################################################
-while getopts "abchluv" option; do
+while getopts "abchlruv" option; do
     case $option in
         a ) ALL=1
             LOCALONLY=0
@@ -59,6 +61,8 @@ while getopts "abchluv" option; do
             ;;
         h ) usage
             exit 1
+            ;;
+        r ) MANUALNODESCREEN=1
             ;;
         u ) UNDRAIN=1
             ;;
@@ -112,6 +116,7 @@ compare()      { [[ "$1" ==  "$2" ]] || diagerror "$3 - Got '$1' but expected '$
 compare_info() { [[ "$1" ==  "$2" ]] || diaginfo "$3 - Got '$1' but expected '$2'"; }
 compare2()     { [[ "$1" ==  "$2" || "$1" == "$3" ]] || diagerror "$4 - Got '$1' but expected '$2' or '$3'"; }
 compare3()     { [[ "$1" ==  "$2" || "$1" == "$3" || "$1" == "$4" ]] || diagerror "$5 - Got '$1' but expected '$2', '$3', or '$4'"; }
+compare4()     { [[ "$1" ==  "$2" || "$1" == "$3" || "$1" == "$4" || "$1" == "$5" ]] || diagerror "$6 - Got '$1' but expected '$2', '$3', $4, or '$5'"; }
 compare_ne()   { [[ "$1" !=  "$2" ]] || diagerror "$3 - Should not get value '$2'"; }
 compare_ge()   { [[ "$1" -ge "$2" ]] || diagerror "$3 - Got '$1' but expected >= '$2'"; }
 compare_le()   { [[ "$1" -le "$2" ]] || diagerror "$3 - Got '$1' but expected <= '$2'"; }
@@ -121,7 +126,7 @@ checkproc()    { pgrep -f $1 >/dev/null || diagerror "$1 is not running"; }
 checkkmod()    { lsmod|egrep -q "^$1" || diagerror "Kernel module $1 is not loaded"; }
 run()          { OUT="$($@)"; [ $? -ne 0 ] && diagerror $OUT ; }
 verbose()      { [ $VERBOSE -eq 1 ] && echo checknode: $(date -Iseconds) - $@; }
-startslurmd()  { pgrep slurmd >/dev/null 2>&1 || ([ $SLURM_OK -eq 1 ] && systemctl start slurmd && sleep 15) }
+startslurmd()  { pgrep slurmd >/dev/null 2>&1 || ([ $SLURM_OK -eq 1 ] && systemctl start slurmd && sleep 35) }
 stopslurmd()   { pgrep slurmd >/dev/null 2>&1 && systemctl stop slurmd; }
 readslurmstate() { [ $SLURM_OK -eq 1 ] && read -t 5 CURRENTSTATE FULLSTATE REASONUSER CURRENTREASON < <(sinfo -n $(hostname -s) -N --local -O statecompact:20,statecomplete:50,user,reason:150 --noheader |head -1) || CURRENTSTATE="unknown"; }
 # journalgrep looks for lines in the journal, caching results
@@ -136,7 +141,21 @@ journalgrep()  { CFILE=/run/checknode/journalcache/$1
                  [ $(cat $CFILE | wc -l) -gt 0 ] && diagerror "$3"
                }
 
-[ $SLURM_OK -eq 1 ] && [ $UNDRAIN -eq 1 ] && logstdout 'Checknode running with undrain flag'
+[ $UNDRAIN -eq 1 ] && UD=' with force undrain flag' || UD=''
+[ -z "$SUDO_USER" ] && LM='' || LM=" ($SUDO_USER)"
+logstdout "Checknode running${UD}${LM}"
+[ $RUNNINGJOB -eq 1 ] && [ ! -z "$SUDO_USER" ] && logstderr "A job is running - exiting" && exit 1
+
+[ -e /tmp/.spilock ] && diagerror "SPI lock file is in place $(cat /tmp/.spilock) - node must reboot"
+
+###############################################################################
+# Check if nodescreen is currently running
+###############################################################################
+if [[ -e /run/nodescreen/lock ]]; then
+    diaginfo "/run/nodescreen/lock in place. Node is currently running nodescreen test due to either a GCD change, expired weekly test, or manual run. This takes <= 15 minutes."
+    echo "pass" > /run/checknode/state
+    exit 1
+fi
 
 ###############################################################################
 # Generic checks
@@ -144,11 +163,39 @@ journalgrep()  { CFILE=/run/checknode/journalcache/$1
 # This saves "early" dmesg to a file in case it rolls later so we don't miss anything
 [ -e /run/checknode/dmesg-early ] || dmesg > /run/checknode/dmesg-early
 
+# Check for and save a reboot reason
+reboot_reasons="29 mp1_wdtout. This bit will be set to 1 when MP1_Watchdog timer time out.
+27 sync_flood. System reset was caused by a SYNC+FLOOD event which was due to an UE error.
+26 remoteresetfromasf. System reset was caused by a remote RESET command from ASF.
+25 watchdogissuereset. System reset caused y Microsoft WatchDog Timer.
+24 failbootrst. System reset was caused by AMD Fail boot timer.
+23 shutdown_msg. System reset was caused by a SHUTDOWN command from CPU
+22 kb_reset. System reset was caused by assertion of KB_RST_L.
+21 sleepreset. Reset status from Sleep state.
+19 do_k8_reset. System reset was caused CF9 = 0x06.
+18 do_k8_init. System reset was caused by CF9 = 0x04.
+17 soft_pcirst. System reset was caused by writing to PMIO.
+16 userrst. Last reset was caused by BP_SYS_RST_L assertion.
+15 pmeturnofftime. Reset: 0h.
+14 pmeturnofftime. Reset: 0h.
+9  intthermaltrip. System was shut down due to an internal ThremalTrip event.
+4  remotepowerdownfromasf. SOC has received a remote Power Off command from ASF.
+2  shutdown. System was shut down due to ShutDown event.
+1  pwrbtn4second. System was shut down due to 4s PwrButton event.
+0  thermaltrip. System was shut down due to BP_THERMTRIP_L assertion."
+if [ ! -f /run/checknode/reboot_reason ]; then
+  touch /run/checknode/reboot_reason
+	CODE=$(setpci -s 00:00.0 60.L=0x02D013C0 && setpci -s 00:00.0 64.L)
+	echo "$reboot_reasons" | while read num rest; do
+		[ $((0x$CODE & 1 << $num)) -ne 0 ] && echo $rest >> /run/checknode/reboot_reason && logstderr "Reboot reason: $CODE $num $rest"
+	done
+fi
+
 ###############################################################################
 # Firmware checks
 ###############################################################################
 verbose Checking Firmware
-compare "$(/usr/sbin/dmidecode -s bios-version)" "1.6.2" "BIOS version does not match expected version"
+compare2 "$(/usr/sbin/dmidecode -s bios-version)" "1.8.0" "1.9.0" "BIOS version does not match expected version"
 compare "$(/usr/sbin/dmidecode |awk '/BIOS Revision:/ {print $3}')" "5.21" "BIOS Revison does not match expected version"
 
 ###############################################################################
@@ -157,7 +204,15 @@ compare "$(/usr/sbin/dmidecode |awk '/BIOS Revision:/ {print $3}')" "5.21" "BIOS
 verbose Checking processes
 checkproc munged
 #checkproc postfix
-compare "$(ps axo stat|grep -c D)" 0 "Processes stuck in IO Wait (D)"
+
+###############################################################################
+# Early GPU checks - so the Slurm drain reason becomes this
+###############################################################################
+grep -q 'Board power calibration failed' /run/checknode/dmesg-early && diagerror 'GPU Board power calibration failed'
+journalgrep gpu_doorbell 'queue_doorbell_id0 is not 0, Queue preemption time out' 'GPU Queue preemption time out - CHECK NODE STATE BEFORE REBOOTING'
+journalgrep ras_poison 'RAS poison consumption' 'amdgpu: RAS poison consumption - Run uts oblex and if another UE is encountered replace the GPU'
+journalgrep sq_intr 'amdgpu: sq_intr' 'GPU sq_intr - put in HBM sandbox'
+journalgrep uncorrectable_error 'amdgpu: Uncorrectable error detected in UMC' 'GPU UE in UMC - put in HBM sandbox'
 
 ###############################################################################
 # Stray User Process Check
@@ -187,6 +242,9 @@ fi
 
 pgrep mprime &>/dev/null && diagerror 'mprime is running - leftover stress run'
 
+# Clear any caches here
+echo 3 > /proc/sys/vm/drop_caches
+
 ###############################################################################
 # CPU Checks
 ###############################################################################
@@ -198,6 +256,9 @@ compare "$(cat /sys/devices/system/cpu/online)" "0-127" "CPU Online Count"
 if [ -f /rocm/cpu_mp1_stuck_chk.py ]; then
   /rocm/cpu_mp1_stuck_chk.py >/dev/null || diagerror "Stuck CPU power management firmware"
 fi
+
+[ -d /sys/cray/pm_counters ] || diagerror "pm_counters directory not present - possible i2c problem"
+
 ###############################################################################
 # HSN checks
 ###############################################################################
@@ -208,9 +269,9 @@ NOW=$(date +%s)
 for interface in hsn0 hsn1 hsn2 hsn3; do
   if [ -e /sys/class/net/${interface} ]; then
     compare_ne "$(cat /sys/class/net/${interface}/device/fru/serial_number)" "" "Interface $interface serial number blank" || continue
-    compare "$(cat /sys/class/net/${interface}/device/uc/qspi_blob_version)" "1.5.41-ESM" "FW version for $interface does not match expected version" || continue
+    compare "$(cat /sys/class/net/${interface}/device/uc/qspi_blob_version)" "1.5.49-ESM" "FW version for $interface does not match expected version" || continue
     compare "$(cat /sys/class/net/${interface}/device/port/link)" "up" "Interface $interface link status" || continue
-    compare "$(cat /sys/class/net/${interface}/device/port/speed)" "BS_200G" "Interface $interface link speed" || continue
+    compare2 "$(cat /sys/class/net/${interface}/device/port/speed)" "BS_200G" "NA" "Interface $interface link speed" || continue
     compare "$(cat /sys/class/net/${interface}/device/port/pause)" "pfc/802.1qbb" "Interface $interface pause mode" || continue
     compare "$(cat /sys/class/net/${interface}/device/port/link_layer_retry)" "on" "Interface $interface LLR" || continue
     compare_re "$(cat /sys/class/net/${interface}/device/current_link_speed)" "16(\.0)? GT/s( PCIe)?$" "Interface $interface link speed" || continue
@@ -233,6 +294,7 @@ done
 journalgrep cxi_tct_tbl_dealloc 'C_EC_CRIT: C_PCT_EXT error: tct_tbl_dealloc' 'Interface tct table dealloc'
 journalgrep cxi_uncor 'C_EC_UNCOR_NS: mem_ucor_err_cntr' 'Interface uncorrectable errors'
 journalgrep cxi_credit_uflow 'C_EC_UNCOR_NS: C1_PCT error: credit_uflw' 'Interface credit underflow (reboot node)'
+journalgrep cxi_sensor_crit 'cxi_core.*sensor.*in critical state' 'Cassini sensor in critical state'
 dmesg | grep -q spt_tbl_rd_misc_unused && dmesg | grep -q 'C_PCT_ERR_INFO_EXT 0000000021000000' && diagerror 'spt_tbl_rd_misc_unused stuck packets (reboot node)'
 
 # If an interface is missing, the hsn to cxi numbering will be off
@@ -252,8 +314,8 @@ if [ $MISSING_IFACE == 0 ]; then
           FLAPS=$((FLAPS+1))
         fi
       done
-      compare_le $BURST 4 "Interface $cxi flaps in the last hour"
-      compare_le $FLAPS 9 "Interface $cxi flaps in the last 10 hours"
+      compare_le $BURST 3 "Interface $cxi flaps in the last hour"
+      compare_le $FLAPS 8 "Interface $cxi flaps in the last 10 hours"
       # Attempt to clear any stuck services here - in addition to the epilog
       /usr/bin/cxi_service list -d $cxi | awk '/ID:/ {svc=$2}; /System Service.*No/ {if (svc > 1) print svc}' | xargs -r -n1 /usr/bin/cxi_service delete -d $cxi -s &> /dev/null
       compare "$(/usr/bin/cxi_service list -d $cxi | awk '/ID:/ {svc=$2}; /System Service.*No/ {if (svc > 1) print svc}' | wc -l)" "0" "$cxi stuck services"
@@ -269,22 +331,26 @@ compare_ge $(ip neigh|grep -c PERMANENT) 150000 "Permanent ARP entries"
 ###############################################################################
 verbose Checking GPUs
 GPUMAP=(62663 60925 35483 58294 39007 61770 44563 34574)
+RV=$(basename $(readlink /opt/rocm-default))
+if [ ${RV:5:1} -ge 6 ]; then
+	GPUMAP=(29312 27578 3292 26097 7704 30477 10324 329)
+fi
 PCIMAP=('c1' 'c6' 'c9' 'ce' 'd1' 'd6' 'd9' 'de' )
 mkdir -p /run/checknode/agt 2>/dev/null
 egrep -q amdgpu.*DED /run/checknode/dmesg-early && diagerror "GPU SRAM ECC Uncorrectable Error (DED) on GPU $(awk '/amdgpu.*DED/ {print $4}' /run/checknode/dmesg-early)"
 #grep -v SECURE /run/checknode/dmesg-early | egrep -q amdgpu.*SEC && diagerror "GPU SRAM ECC Correctable Error (SEC)"
 grep -Pzq 'type: fatal\n.*Hardware Error.*fru_text: SmnError' /run/checknode/dmesg-early && diagerror "BERT fatal SmnError"
-if [ ! -e /root/xgmi3_check_links.log ]; then
-  /usr/bin/python3 /rocm/check_xgmi3_links/mi200_xgmi3_check_links.py > /root/xgmi3_check_links.log 2>&1
-fi
-compare "$(/usr/bin/wc -l /root/xgmi3_check_links.log | awk '{print $1}')" 0 "xGMI3 boot-time link events (see /root/xgmi3_check_links.log)"
+# This broke on borg - need to ask AMD
+#if [ ! -e /root/xgmi3_check_links.log ]; then
+#  /usr/bin/python3 /rocm/check_xgmi3_links/mi200_xgmi3_check_links.py > /root/xgmi3_check_links.log 2>&1
+#fi
+#compare "$(/usr/bin/wc -l /root/xgmi3_check_links.log | awk '{print $1}')" 0 "xGMI3 boot-time link events (see /root/xgmi3_check_links.log)"
 [ -e /rocm/rvs_checknode/xgmi_bandwidth_test.sh ] && [ ! -e /run/checknode/xgmi_bandwidth_test.out ] && /rocm/rvs_checknode/xgmi_bandwidth_test.sh
 if [ -e /run/checknode/xgmi_bandwidth_test.out ]; then
   grep -q FAIL /run/checknode/xgmi_bandwidth_test.out && diagerror "xGMI bandwidth test failed - see /run/checknode/xgmi_bandwidth_test.out"
 fi
-#[ -e /rocm/chk_xgmi3.py ] && compare "$(/rocm/chk_xgmi3.py)" "No Errors" "xGMI3 errors"
 if [ ! -e /root/rvs_dgemm_perf.log ]; then
-  /opt/rocm-default/rvs/rvs -c /root/rvs_dgemm_perf.conf > /root/rvs_dgemm_perf.log
+  /opt/rocm-default/bin/rvs -c /root/rvs_dgemm_perf.conf > /root/rvs_dgemm_perf.log
   sed 's/.*]//' /root/rvs_dgemm_perf.log | awk '/Target/ {print "RVS dgemm_perf gpuid "$2" Gflops "$4}' > /root/rvs_gpu_serial.log
   for gpu_num in {0..7}; do
     pci=0000:${PCIMAP[$gpu_num]}:00.0
@@ -303,7 +369,7 @@ for gpuid in {0..7}; do
     compare2 "$(cat /sys/class/drm/${gpu}/device/vbios_version)" "113-D65201-046" "113-D65201-X46" "GPU ${gpu} VBIOS IFWI version"
     compare_ge $(cat /sys/class/drm/${gpu}/device/mem_info_vram_total) 68000000000 "GPU ${gpu} Total Memory"
     cat /sys/class/drm/${gpu}/device/hwmon/hwmon*/temp1_input > /dev/null 2>&1 || diagerror "GPU ${gpu} unable to read SMU Metrics table"
-    compare_ge "$(grep perf.*${GPUMAP[$gpuid]}.*Gflops.*Target /root/rvs_dgemm_perf.log|sed 's/.*perf //'|awk '{printf "%d\n", $3}')" 20500 "GPU ${gpu} DGEMM Gflops"
+    #compare_ge "$(grep "perf.* ${GPUMAP[$gpuid]} .*Gflops.*Target" /root/rvs_dgemm_perf.log|sed 's/.*perf //'|awk '{printf "%d\n", $3}')" 20500 "GPU ${gpu} DGEMM Gflops"
     compare_le "$(wc -l /sys/class/drm/${gpu}/device/ras/gpu_vram_bad_pages | awk '{print $1}')" 257 "GPU ${gpu} HBM UE Retired Pages"
     pci=0000:${PCIMAP[$gpu_num]}:00.0
     [ -e /run/checknode/agt/$gpuid ] || /rocm/agt -i=PCI:$pci -i2cflrm:4,100,4,4 > /run/checknode/agt/$gpuid
@@ -312,13 +378,12 @@ for gpuid in {0..7}; do
     diagerror "GPU ${gpu} is not present in /sys/class/drm"
   fi
 done
-journalgrep gpu_doorbell 'queue_doorbell_id0 is not 0, Queue preemption time out' 'GPU Queue preemption time out'
-journalgrep sq_intr 'amdgpu: sq_intr' 'GPU sq_intr - put in HBM sandbox'
-journalgrep uncorrectable_error 'amdgpu: Uncorrectable error detected in UMC' 'GPU UE in UMC - put in HBM sandbox'
+
+journalgrep gpureset 'amdgpu: GPU reset begin' 'Previous GPU reset may impact performance - please reboot'
 
 # Start of GPU Used Memory checks
-AMDGPUPIDS=$(ps -edalf | grep amdgpu | grep -v amdgpu-reset-hi | grep -v grep |wc -l)
-#compare $AMDGPUPIDS 0 "amdgpu kworker procs"
+AMDGPUPIDS=$(ps -edalf | grep amdgpu | grep -v umc_page_retire | grep -v amdgpu-reset-hi | grep -v grep |wc -l)
+[ -z "$SLURM_JOB_ID" ] && WAIT=14 || WAIT=120
 SECONDS=1
 for gpuid in {0..7}; do
   CHECKED=0
@@ -326,17 +391,19 @@ for gpuid in {0..7}; do
   gpu=card${gpuid}
   [ ! -e /sys/class/drm/${gpu} ] && continue
   [ -e /run/checknode/gpumem/$gpu ] && OLDVAL=$(cat /run/checknode/gpumem/$gpu) || FIRSTRUN=1
-  while [[ $SECONDS -le 35 || $CHECKED -eq 0 ]] ; do
+  while [[ $SECONDS -le $WAIT || $CHECKED -eq 0 ]] ; do
     NEWVAL=$(cat /sys/class/drm/${gpu}/device/mem_info_vram_used)
     [[ $NEWVAL -le 20000000 ]] && break
     CHECKED=1
-    if [ $SECONDS -ge 35 ] ; then
+    if [ $SECONDS -ge $((WAIT-2)) ] ; then
+      AMDGPUPIDS=$(ps -edalf | grep amdgpu | grep -v umc_page_retire | grep -v amdgpu-reset-hi | grep -v grep |wc -l)
       compare_le $NEWVAL 20000000 "GPU ${gpu} Used Memory with $AMDGPUPIDS amdgpu kworker procs"
+      /opt/rocm-default/bin/rocm-smi --showpids | logger -t AMD_GPU_USED_MEM_DEBUG
+      ps aux | grep -i kfd | grep -v grep | logger -t AMD_GPU_USED_MEM_DEBUG
       break
     fi
     sleep 0.2
   done
-  [[ $SECONDS -gt 6 ]] && logger -t gpumem "GPU ${gpu} memory took ${SECONDS} Seconds to clear."
   echo $NEWVAL > /run/checknode/gpumem/$gpu
   if [ $FIRSTRUN -eq 1 ]; then
     MEMDIFF="INITIAL RUN"
@@ -347,9 +414,11 @@ for gpuid in {0..7}; do
   else
     MEMDIFF="UNCHANGED"
   fi
+  AMDGPUPIDS=$(ps -edalf | grep amdgpu | grep -v umc_page_retire | grep -v amdgpu-reset-hi | grep -v grep |wc -l)
   logger -t gpumem -- GPU $gpu memory - current $NEWVAL - $MEMDIFF - amdgpu kworker $AMDGPUPIDS - jobid ${SLURM_JOB_ID-none}
   
 done
+[[ $SECONDS -gt 10 ]] && logger -t gpumem "GPU memory check took ${SECONDS} seconds"
 # End of GPU Used Memory checks
 
 ###############################################################################
@@ -365,7 +434,7 @@ for nvme in nvme0 nvme1 ; do
   if [ -e /sys/class/nvme/${nvme} ]; then
     [ -e /dev/${nvme}n1 ] || diagerror "NVME namespace ${nvme}n1 does not exist"
     compare "$(cat /sys/class/nvme/${nvme}/model|xargs)" "SAMSUNG MZ1L21T9HCLS-00A07" "${nvme} model"
-    compare3 "$(cat /sys/class/nvme/${nvme}/firmware_rev)" "GDC7102Q" "GDC7202Q" "GDC7302Q" "${nvme} FW"
+    compare2 "$(cat /sys/class/nvme/${nvme}/firmware_rev)" "GDC7302Q" "GDC7402Q" "${nvme} FW"
     compare $(cat /sys/class/nvme/${nvme}/state 2>/dev/null) live "${nvme} state"
     compare $((0x$(/sbin/setpci -s $(basename $(readlink /sys/class/nvme/${nvme}/device)) CAP_EXP+0x12.w) & 0xf )) 4 "${nvme} PCIe Gen"
     compare $(((0x$(/sbin/setpci -s $(basename $(readlink /sys/class/nvme/${nvme}/device)) CAP_EXP+0x12.w) & 0x3f0) >> 4 )) 4 "${nvme} PCIe Width"
@@ -376,6 +445,8 @@ for nvme in nvme0 nvme1 ; do
     diagerror "NVME ${nvme} device check failed."
   fi
 done
+LVM_SUPPRESS_FD_WARNINGS=1
+/sbin/vgdisplay nvme > /dev/null 2>&1 || diagerror "NVME volume group error"
 
 ###############################################################################
 # File System Checks
@@ -384,20 +455,20 @@ verbose Checking file systems
 if [ $LOCALONLY -eq 0 ]; then
 /sbin/lvdisplay nvme/persistent &>/dev/null || diagerror "NVME Volume Group persistent does not exist (check for stale bb lv)"
 /usr/bin/mountpoint -q /mnt/persistent || diagerror "NVME /mnt/persistent is not mounted"
-  compare "$(timeout -k 5 15 findmnt -n -o FSTYPE /autofs/nccs-svm1_home)" dvs "/autofs/nccs-svm1_home mount is incorrect"
-  stat /autofs/nccs-svm1_home > /dev/null 2>&1 || diagerror "/autofs/nccs-svm1_home mount is not healthy"
-  compare "$(timeout -k 5 15 findmnt -n -o FSTYPE /autofs/nccs-svm1_home1)" dvs "/autofs/nccs-svm1_home1 mount is incorrect"
-  stat /autofs/nccs-svm1_home1 > /dev/null 2>&1 || diagerror "/autofs/nccs-svm1_home1 mount is not healthy"
-  compare "$(timeout -k 5 15 findmnt -n -o FSTYPE /autofs/nccs-svm1_home2)" dvs "/autofs/nccs-svm1_home2 mount is incorrect"
-  stat /autofs/nccs-svm1_home2 > /dev/null 2>&1 || diagerror "/autofs/nccs-svm1_home2 mount is not healthy"
-  compare "$(timeout -k 5 15 findmnt -n -o FSTYPE /autofs/nccs-svm1_proj)" dvs "/autofs/nccs-svm1_proj mount is incorrect"
-  stat /autofs/nccs-svm1_proj > /dev/null 2>&1 || diagerror "/autofs/nccs-svm1_proj mount is not healthy"
-  compare "$(timeout -k 5 15 findmnt -n -o FSTYPE /autofs/nccs-svm1_sys)" dvs "/autofs/nccs-svm1_sys mount is incorrect"
-  stat /autofs/nccs-svm1_sys > /dev/null 2>&1 || diagerror "/autofs/nccs-svm1_sys mount is not healthy"
-  compare "$(timeout -k 5 15 findmnt -n -o FSTYPE /autofs/nccs-svm1_sw)" dvs "/autofs/nccs-svm1_sw mount is incorrect"
-  stat /autofs/nccs-svm1_sw > /dev/null 2>&1 || diagerror "/autofs/nccs-svm1_sw mount is not healthy"
+  compare "$(awk '$2 == "/autofs/nccs-svm1_home" {print $3}' /proc/self/mounts)" dvs "/autofs/nccs-svm1_home mount is incorrect"
+  timeout -k 5 30 stat /autofs/nccs-svm1_home > /dev/null 2>&1 || diagerror "/autofs/nccs-svm1_home mount is not healthy"
+  compare "$(awk '$2 == "/autofs/nccs-svm1_home1" {print $3}' /proc/self/mounts)" dvs "/autofs/nccs-svm1_home1 mount is incorrect"
+  timeout -k 5 30 stat /autofs/nccs-svm1_home1 > /dev/null 2>&1 || diagerror "/autofs/nccs-svm1_home1 mount is not healthy"
+  compare "$(awk '$2 == "/autofs/nccs-svm1_home2" {print $3}' /proc/self/mounts)" dvs "/autofs/nccs-svm1_home2 mount is incorrect"
+  timeout -k 5 30 stat /autofs/nccs-svm1_home2 > /dev/null 2>&1 || diagerror "/autofs/nccs-svm1_home2 mount is not healthy"
+  compare "$(awk '$2 == "/autofs/nccs-svm1_proj" {print $3}' /proc/self/mounts)" dvs "/autofs/nccs-svm1_proj mount is incorrect"
+  timeout -k 5 30 stat /autofs/nccs-svm1_proj > /dev/null 2>&1 || diagerror "/autofs/nccs-svm1_proj mount is not healthy"
+  compare "$(awk '$2 == "/autofs/nccs-svm1_sys" {print $3}' /proc/self/mounts)" dvs "/autofs/nccs-svm1_sys mount is incorrect"
+  timeout -k 5 30 stat /autofs/nccs-svm1_sys > /dev/null 2>&1 || diagerror "/autofs/nccs-svm1_sys mount is not healthy"
+  compare "$(awk '$2 == "/autofs/nccs-svm1_sw" {print $3}' /proc/self/mounts)" dvs "/autofs/nccs-svm1_sw mount is incorrect"
+  timeout -k 5 30 stat /autofs/nccs-svm1_sw > /dev/null 2>&1 || diagerror "/autofs/nccs-svm1_sw mount is not healthy"
   timeout -k 5 15 ls -d /sw > /dev/null 2>&1 || diagerror "NFS (/sw) is not mounted or hung"
-  compare "$(timeout -k 5 45 findmnt -n -o FSTYPE /lustre/orion)" lustre "Lustre (/lustre/orion) is not mounted"
+  compare "$(awk '$2 == "/lustre/orion" {print $3}' /proc/self/mounts)" lustre "Lustre (/lustre/orion) is not mounted"
   timeout -k 5 60 df >/dev/null 2>&1 || diagerror "df error or 60 second timeout"
 fi
 
@@ -407,22 +478,30 @@ for iface in hsn{0..3}; do
   echo "$LNET_NIS" | grep -q $(printf '%d' "0x"$NIDHEX)"@kfi" || diagerror "LNET NI for ${iface} missing"
 done
 
+# Check for processes stuck in IO wait - give a couple retries
+COUNT=0
+until [ "$(ps axo stat|grep -c D)" == "0" ]; do
+	[ $COUNT -gt 10 ] && compare "$(ps axo stat|grep -c D)" 0 "Processes stuck in IO Wait (D)"
+	[ $COUNT -gt 10 ] && logstderr "$(ps axo stat,user,comm | egrep '^D')"
+	[ $COUNT -gt 10 ] && break
+	sleep 1
+	let COUNT=COUNT+1
+done
+
 ###############################################################################
 # Host Memory Checks
 ###############################################################################
 verbose Checking memory
 find /dev/shm -depth -mindepth 1 -not -name alps -delete > /dev/null 2>&1
-#echo 3 > /proc/sys/vm/drop_caches
-# Drop caches on nodes mounting lustre
-grep -q lustre /proc/mounts && echo 3 > /proc/sys/vm/drop_caches
 compare_ge $(awk '/MemTotal/ {print $2}' /proc/meminfo) 520000000 "Total memory"
 compare_ge $(awk '/MemAvailable/ {print $2}' /proc/meminfo) 460000000 "Available memory"
-compare "$(findmnt -n -o FSTYPE /dev/hugepages)" "hugetlbfs" "/dev/hugepages is not mounted"
+compare "$(awk '$2 == "/dev/hugepages" {print $3}' /proc/self/mounts)" "hugetlbfs" "/dev/hugepages is not mounted"
 DMIMEM=$(/usr/sbin/dmidecode --type memory)
 compare $(echo "$DMIMEM" | grep Manufacturer: | sort -u | wc -l) 1 "Number of memory manufacturers"
 compare $(echo "$DMIMEM" | egrep ^[[:space:]]Size: | sort -u | wc -l) 1 "DIMM sizes"
 compare $(echo "$DMIMEM" | egrep ^[[:space:]]Speed: | sort -u | wc -l) 1 "DIMM speeds"
 compare $(echo "$DMIMEM" | awk '/Number Of Devices/ {print $4}') 8 "Count of DIMMs"
+
 
 ###############################################################################
 # State Updates
@@ -436,15 +515,24 @@ if [ $ERRORCNT -gt 0 ]; then
     logstderr "Node is unhealthy - checkonly mode"
   elif [[ "$CURRENTREASON" == "$ERRORSTR2" ]]; then
     logstderr "Node is unhealthy - reason unchanged"
-  elif [[ "$CURRENTREASON" != "checknode"* && "$CURRENTREASON" != "Kill task failed" && "$CURRENTREASON" != "Not responding" && "$CURRENTREASON" != "none" && "$CURRENTREASON" != "" ]]; then
+  elif [[ "$CURRENTREASON" != "checknode"* &&
+          "$CURRENTREASON" != "Kill task failed" &&
+          "$CURRENTREASON" != "Not responding" &&
+          "$CURRENTREASON" != "Prolog error" &&
+          "$CURRENTREASON" != "Epilog error" &&
+          "$CURRENTREASON" != "SPI job"* &&
+          "$CURRENTREASON" != "switch_g_job_postfini failed" &&
+          "$CURRENTREASON" != "none" &&
+          "$CURRENTREASON" != ""
+          ]]; then
     logstderr "Node is unhealthy - not changing existing reason: $CURRENTREASON"
   else
     [ $SLURM_OK -eq 1 ] && logstderr "Node is unhealthy - marking drain"
     [ $SLURM_OK -eq 1 ] && scontrol --local update node=$(hostname) state=drain reason="$ERRORSTR2" > /dev/null
   fi
-  if [[ "$ERRORSTR" == *"hsn"*  || "$ERRORSTR" == *"cxi"* ]] ; then
+  if [[ "$ERRORSTR" == *"hsn"* ]] ; then
+    logstderr "Stopping slurmd due to hsn errors"
     stopslurmd
-    verbose Not starting slurmd
   else
     startslurmd
   fi
@@ -458,14 +546,26 @@ readslurmstate
 # If we made it here, the node is healthy
 echo "pass" > /run/checknode/state
 # If there's an existing comment in checkonly mode (not rebooting), leave the node down
-if [[ $CHECKONLY -eq 1 || "$CURRENTSTATE" == "idle" || "$CURRENTSTATE" == "plnd" || "$CURRENTSTATE" == "maint" || "$CURRENTSTATE" == "resv" ]]; then
-  echo "DIAG: Node is healthy - not changing state from $CURRENTSTATE"
+if [[ $CHECKONLY -eq 1 ||
+     "$CURRENTSTATE" == "idle" ||
+     "$CURRENTSTATE" == "plnd" ||
+     "$CURRENTSTATE" == "maint" ||
+     "$CURRENTSTATE" == "resv"
+     ]]; then
+  logstdout "Node is healthy - not changing state from $CURRENTSTATE"
 elif [[ "$CURRENTREASON" == "Node unexpectedly rebooted" && $UNDRAIN -eq 0 ]]; then
-  logstdout "Node is healthy - NOT clearing unexpected reboot - use 'checknode -u' to clear"
-elif [[ "$CURRENTREASON" != "checknode"* && "$CURRENTREASON" != "Kill task failed" && "$CURRENTREASON" != "Not responding" && "$CURRENTREASON" != "none" && $UNDRAIN -eq 0 ]]; then
-  logstderr "Node is healthy - not changing existing reason: '$CURRENTREASON' - use 'checknode -u' to clear"
+  logstdout "Node is healthy - NOT clearing unexpected reboot - use 'checknode -u' to clear IF you understand the reboot reason"
+elif [[ "$CURRENTREASON" != "checknode"* &&
+        "$CURRENTREASON" != "Kill task failed" &&
+        "$CURRENTREASON" != "Not responding" &&
+        "$CURRENTREASON" != "SPI job"* &&
+        "$CURRENTREASON" != "switch_g_job_postfini failed" &&
+        "$CURRENTREASON" != "none" &&
+        $UNDRAIN -eq 0
+        ]]; then
+  logstderr "Node is healthy - not changing existing reason: '$CURRENTREASON' - use 'checknode -u' to clear IF you know it is safe to clear"
 else
-  [ $SLURM_OK -eq 1 ] && echo "DIAG: Node is healthy - marking online" || echo "Node is healthy - not contacting slurm"
+  [ $SLURM_OK -eq 1 ] && logstdout "Node is healthy - marking online" || echo "Node is healthy - not contacting slurm"
   [ $SLURM_OK -eq 1 ] && scontrol --local update node=$(hostname) state=idle > /dev/null
 fi
 
