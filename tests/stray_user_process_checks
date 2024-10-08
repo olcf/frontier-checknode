@@ -1,0 +1,27 @@
+#!/bin/bash
+
+#verbose Checking user processes
+### TODO: map into how SLURM will be configured on cluster
+#mkdir -p /sys/fs/cgroup/cpuset/slurm 2>/dev/null
+#if [[ $RUNNINGJOB -ne 1 ]]; then
+#        # First try to kill any processes under Slurm
+#        STRAYPROCS=0
+#        COUNT=0
+#       until [ -z "$(find /sys/fs/cgroup/cpuset/slurm/ -name tasks -not -path '*system*' -exec cat {} \;)" ];do
+#                [ $COUNT -gt 15 ] && STRAYPROCS=1
+#                [ $COUNT -gt 15 ] && diagerror "Unkillable user processes still present from $(find /sys/fs/cgroup/cpuset/slurm/ -mindepth 2 -maxdepth 2 -type d -exec basename {} \; | tr '\n' ' ')"
+#                [ $COUNT -gt 15 ] && find /sys/fs/cgroup/cpuset/slurm/ -name tasks -not -path '*system*' -exec cat {} \; | sort | uniq | xargs -IHERE /bin/bash -c 'echo "--- Unkillable process $(cat /proc/HERE/comm) pid HERE ---"; cat /proc/HERE/stack' | logger -t unkillable_process
+#                [ $COUNT -gt 15 ] && break
+#                find /sys/fs/cgroup/cpuset/slurm/ -name tasks -not -path '*system*' -exec cat {} \; | xargs --no-run-if-empty kill -9 >/dev/null 2>&1
+#                sleep 2
+#                let COUNT=COUNT+1
+#        done
+
+#        # Try to remove any stray cpuset directories
+#        [ $STRAYPROCS -eq 0 ] && find /sys/fs/cgroup/cpuset/slurm/ -depth -mindepth 1 -type d -not -name system -delete > /dev/null 2>&1
+#        [ $STRAYPROCS -eq 0 ] && compare "$(find /sys/fs/cgroup/cpuset/slurm/ -mindepth 1 -type d -not -name system -exec basename {} \;| tr '\n' ' ')" "" "Stray cgroup directories"
+
+        #compare "$(pgrep slurmstepd | wc -l)" 0 "Hung slurmstepd processes"
+#fi
+
+exit 0

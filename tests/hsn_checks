@@ -1,0 +1,40 @@
+#!/bin/bash
+
+#verbose Checking HSN Link Speed and AMA
+#MISSING_IFACE=0
+#NOW=$(date +%s)
+#for interface in `ls /sys/class/net/`; do
+  # skip virtual networks
+#  if ( grep -q virtual `readlink -f /sys/class/net/$interface` ); then
+#    echo " skipping $interface..."
+#  else
+#    if [ -e /sys/class/net/${interface} ]; then
+#      compare_ne "$(cat /sys/class/net/${interface}/device/fru/serial_number)" "" "Interface $interface serial number blank" || continue
+#      compare "$(cat /sys/class/net/${interface}/device/uc/qspi_blob_version)" "1.5.49-ESM" "FW version for $interface does not match expected version" || continue
+#      compare "$(cat /sys/class/net/${interface}/device/port/link)" "up" "Interface $interface link status" || continue
+#      compare2 "$(cat /sys/class/net/${interface}/device/port/speed)" "BS_200G" "NA" "Interface $interface link speed" || continue
+#      compare "$(cat /sys/class/net/${interface}/device/port/pause)" "pfc/802.1qbb" "Interface $interface pause mode" || continue
+#      compare "$(cat /sys/class/net/${interface}/device/port/link_layer_retry)" "on" "Interface $interface LLR" || continue
+#      compare_re "$(cat /sys/class/net/${interface}/device/current_link_speed)" "16(\.0)? GT/s( PCIe)?$" "Interface $interface link speed" || continue
+#      compare "$(cat /sys/class/net/${interface}/device/current_link_width)" 16 "Interface $interface link width" || continue
+#      compare "$(cat /sys/class/net/${interface}/device/properties/speed)" 200000 "Interface $interface speed" || continue
+#      compare "$(cat /sys/class/net/${interface}/device/properties/current_esm_link_speed)" "25.0 GT/s" "Interface $interface ESM speed" || continue
+#      compare "$(cat /sys/class/net/${interface}/device/properties/link)" 1 "Interface $interface link" || continue
+#      compare "$(cat /sys/class/net/${interface}/addr_assign_type)" 3 "Interface $interface mac mode" || continue
+#      iface_ip=$(ip -brief -4 a ls ${interface} | awk '{print $3}'|sed 's/\/.*//')
+#      expected_mac=$(awk -v IP=$iface_ip '$2 == IP {print $1}' /etc/ethers 2>/dev/null)
+#      [ -z "$expected_mac" ] || compare "$(cat /sys/class/net/${interface}/address)" $expected_mac "Interface $interface AMA" || continue
+#      [ -e /root/${interface}_down_allowed ] || echo 10 > /root/${interface}_down_allowed
+#      compare_le $(echo "$CXIPCI" | awk -F= -viface=$interface 'BEGIN{max=0}$0 ~ iface {if ($2>max) max=$2}END{print max}') 480 "Interface $interface PCIe 1-minute burst"
+#      compare_le $(echo "$CXIPCI" | awk -viface=$interface -vnow=$NOW 'BEGIN{COUNT=0}$6 ~ iface && $1 > now - (60*60*10) {COUNT++}END{print COUNT}') 300 "Interface $interface PCIe 1-minute hits in a 10 hour window"
+#    else
+#      diagerror "Interface ${interface} is not present in /sys/class/net"
+#      MISSING_IFACE=1
+#    fi
+#  fi
+#done
+
+exit 0
+
+
+

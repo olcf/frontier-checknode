@@ -1,0 +1,5 @@
+#!/bin/bash
+
+
+# Clear any caches here
+echo 3 > /proc/sys/vm/drop_caches

@@ -1,0 +1,11 @@
+#!/bin/bash
+
+#verbose CPU Checks
+#compare "$(cat /sys/devices/system/cpu/online)" "0-127" "CPU Online Count" && exit 0
+# CPU appears to jump frequencies - re-enable later
+#compare "$(lscpu | grep "CPU MHz" | awk '{print $3}')" "2250.000" "CPU Frequency Check"
+
+#if [ -f /rocm/cpu_mp1_stuck_chk.py ]; then
+#  /rocm/cpu_mp1_stuck_chk.py >/dev/null || diagerror "Stuck CPU power management firmware"
+#fi
+exit 0

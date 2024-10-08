@@ -1,0 +1,33 @@
+#!/bin/bash
+
+
+# Check for and save a reboot reason
+reboot_reasons="29 mp1_wdtout. This bit will be set to 1 when MP1_Watchdog timer time out.
+27 sync_flood. System reset was caused by a SYNC+FLOOD event which was due to an UE error.
+26 remoteresetfromasf. System reset was caused by a remote RESET command from ASF.
+25 watchdogissuereset. System reset caused y Microsoft WatchDog Timer.
+24 failbootrst. System reset was caused by AMD Fail boot timer.
+23 shutdown_msg. System reset was caused by a SHUTDOWN command from CPU
+22 kb_reset. System reset was caused by assertion of KB_RST_L.
+21 sleepreset. Reset status from Sleep state.
+19 do_k8_reset. System reset was caused CF9 = 0x06.
+18 do_k8_init. System reset was caused by CF9 = 0x04.
+17 soft_pcirst. System reset was caused by writing to PMIO.
+16 userrst. Last reset was caused by BP_SYS_RST_L assertion.
+15 pmeturnofftime. Reset: 0h.
+14 pmeturnofftime. Reset: 0h.
+9  intthermaltrip. System was shut down due to an internal ThremalTrip event.
+4  remotepowerdownfromasf. SOC has received a remote Power Off command from ASF.
+2  shutdown. System was shut down due to ShutDown event.
+1  pwrbtn4second. System was shut down due to 4s PwrButton event.
+0  thermaltrip. System was shut down due to BP_THERMTRIP_L assertion."
+### TODO: create map for MI300X
+#if [ ! -f /run/checknode/reboot_reason ]; then
+#  touch /run/checknode/reboot_reason
+#	CODE=$(setpci -s 00:00.0 60.L=0x02D013C0 && setpci -s 00:00.0 64.L)
+#	echo "$reboot_reasons" | while read num rest; do
+#		[ $((0x$CODE & 1 << $num)) -ne 0 ] && echo $rest >> /run/checknode/reboot_reason && logstderr "Reboot reason: $CODE $num $rest"
+#	done
+#fi
+
+exit 0

@@ -1,4 +1,7 @@
-#!/bin/bash
+#!/usr/bin/env -S python3
+
+import subprocess as sp
+
 #
 # Boot-time and run-time diagnostics
 # Checks for the presence/health of various components

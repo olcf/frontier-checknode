@@ -1,0 +1,95 @@
+#!/bin/bash
+
+#verbose Checking GPUs
+### TODO: map into MI300X
+#GPUMAP=(62663 60925 35483 58294 39007 61770 44563 34574)
+#RV=$(basename $(readlink /opt/rocm-default))
+#if [ ${RV:5:1} -ge 6 ]; then
+	#GPUMAP=(29312 27578 3292 26097 7704 30477 10324 329)
+#fi
+#PCIMAP=('c1' 'c6' 'c9' 'ce' 'd1' 'd6' 'd9' 'de' )
+#mkdir -p /run/checknode/agt 2>/dev/null
+#egrep -q amdgpu.*DED /run/checknode/dmesg-early && diagerror "GPU SRAM ECC Uncorrectable Error (DED) on GPU $(awk '/amdgpu.*DED/ {print $4}' /run/checknode/dmesg-early)"
+#grep -v SECURE /run/checknode/dmesg-early | egrep -q amdgpu.*SEC && diagerror "GPU SRAM ECC Correctable Error (SEC)"
+#grep -Pzq 'type: fatal\n.*Hardware Error.*fru_text: SmnError' /run/checknode/dmesg-early && diagerror "BERT fatal SmnError"
+
+### TODO: xgmi bandwidth test location, and map into RVS tests
+#[ -e /rocm/rvs_checknode/xgmi_bandwidth_test.sh ] && [ ! -e /run/checknode/xgmi_bandwidth_test.out ] && /rocm/rvs_checknode/xgmi_bandwidth_test.sh
+#if [ -e /run/checknode/xgmi_bandwidth_test.out ]; then
+#  grep -q FAIL /run/checknode/xgmi_bandwidth_test.out && diagerror "xGMI bandwidth test failed - see /run/checknode/xgmi_bandwidth_test.out"
+#fi
+
+### TODO: map into MI300X, RVS DGEMM perf tests
+#if [ ! -e /root/rvs_dgemm_perf.log ]; then
+#  /opt/rocm-default/bin/rvs -c /root/rvs_dgemm_perf.conf > /root/rvs_dgemm_perf.log
+#  sed 's/.*]//' /root/rvs_dgemm_perf.log | awk '/Target/ {print "RVS dgemm_perf gpuid "$2" Gflops "$4}' > /root/rvs_gpu_serial.log
+#  for gpu_num in {0..7}; do
+#    pci=0000:${PCIMAP[$gpu_num]}:00.0
+#    [ -e /run/checknode/agt/$gpu_num ] || /rocm/agt -i=PCI:$pci -i2cflrm:4,100,4,4 > /run/checknode/agt/$gpu_num
+#    fru=$(grep Serial /run/checknode/agt/$gpu_num | awk '{print ""$5""}')
+#    awk -v fru=$fru -v pci=$pci '/'${GPUMAP[$gpu_num]}'/ {print $0 " FRU_SERIAL "fru" PCI_ADDR "pci}' /root/rvs_gpu_serial.log | logger
+#  done
+#fi
+#grep -q "Failed to read EEPROM table header" /run/checknode/dmesg-early && diagerror "Failed to read EEPROM table header"
+
+#mkdir -p /run/checknode/gpumem 2>/dev/null
+#for gpuid in {0..7}; do
+#  gpu=card${gpuid}
+#  if [ -e /sys/class/drm/${gpu} ]; then
+#    compare_re "$(cat /sys/class/drm/${gpu}/device/current_link_speed)" "16(\.0)? GT/s( PCIe)?$" "GPU ${gpu} link speed"
+#    compare "$(cat /sys/class/drm/${gpu}/device/current_link_width)" 16 "GPU ${gpu} link width"
+#    compare2 "$(cat /sys/class/drm/${gpu}/device/vbios_version)" "113-D65201-046" "113-D65201-X46" "GPU ${gpu} VBIOS IFWI version"
+#    compare_ge $(cat /sys/class/drm/${gpu}/device/mem_info_vram_total) 68000000000 "GPU ${gpu} Total Memory"
+#    cat /sys/class/drm/${gpu}/device/hwmon/hwmon*/temp1_input > /dev/null 2>&1 || diagerror "GPU ${gpu} unable to read SMU Metrics table"
+    #compare_ge "$(grep "perf.* ${GPUMAP[$gpuid]} .*Gflops.*Target" /root/rvs_dgemm_perf.log|sed 's/.*perf //'|awk '{printf "%d\n", $3}')" 20500 "GPU ${gpu} DGEMM Gflops"
+#    compare_le "$(wc -l /sys/class/drm/${gpu}/device/ras/gpu_vram_bad_pages | awk '{print $1}')" 257 "GPU ${gpu} HBM UE Retired Pages"
+#    pci=0000:${PCIMAP[$gpu_num]}:00.0
+#    [ -e /run/checknode/agt/$gpuid ] || /rocm/agt -i=PCI:$pci -i2cflrm:4,100,4,4 > /run/checknode/agt/$gpuid
+#    compare "$(awk '/FW version/ {print $6}' /run/checknode/agt/$gpuid)" "3.16" "GPU $gpu RM version"
+#  else
+#    diagerror "GPU ${gpu} is not present in /sys/class/drm"
+#  fi
+#done
+
+
+# Start of GPU Used Memory checks
+#AMDGPUPIDS=$(ps -edalf | grep amdgpu | grep -v umc_page_retire | grep -v amdgpu-reset-hi | grep -v grep |wc -l)
+#[ -z "$SLURM_JOB_ID" ] && WAIT=14 || WAIT=120
+#SECONDS=1
+#for gpuid in {0..7}; do
+#  CHECKED=0
+#  FIRSTRUN=0
+#  gpu=card${gpuid}
+#  [ ! -e /sys/class/drm/${gpu} ] && continue
+#  [ -e /run/checknode/gpumem/$gpu ] && OLDVAL=$(cat /run/checknode/gpumem/$gpu) || FIRSTRUN=1
+#  while [[ $SECONDS -le $WAIT || $CHECKED -eq 0 ]] ; do
+#    NEWVAL=$(cat /sys/class/drm/${gpu}/device/mem_info_vram_used)
+#    [[ $NEWVAL -le 20000000 ]] && break
+#    CHECKED=1
+#    if [ $SECONDS -ge $((WAIT-2)) ] ; then
+#      AMDGPUPIDS=$(ps -edalf | grep amdgpu | grep -v umc_page_retire | grep -v amdgpu-reset-hi | grep -v grep |wc -l)
+#      compare_le $NEWVAL 20000000 "GPU ${gpu} Used Memory with $AMDGPUPIDS amdgpu kworker procs"
+#      /opt/rocm-default/bin/rocm-smi --showpids | logger -t AMD_GPU_USED_MEM_DEBUG
+#      ps aux | grep -i kfd | grep -v grep | logger -t AMD_GPU_USED_MEM_DEBUG
+#      break
+#    fi
+#    sleep 0.2
+#  done
+#  echo $NEWVAL > /run/checknode/gpumem/$gpu
+#  if [ $FIRSTRUN -eq 1 ]; then
+#    MEMDIFF="INITIAL RUN"
+#  elif [ $NEWVAL -gt $OLDVAL ]; then
+#    MEMDIFF="INCREASE of $((NEWVAL-OLDVAL))"
+#  elif [ $OLDVAL -lt $NEWVAL ]; then
+#    MEMDIFF="DECREASE of $((OLDVAL-NEWVAL))"
+#  else
+#    MEMDIFF="UNCHANGED"
+#  fi
+#  AMDGPUPIDS=$(ps -edalf | grep amdgpu | grep -v umc_page_retire | grep -v amdgpu-reset-hi | grep -v grep |wc -l)
+#  logger -t gpumem -- GPU $gpu memory - current $NEWVAL - $MEMDIFF - amdgpu kworker $AMDGPUPIDS - jobid ${SLURM_JOB_ID-none}
+  
+#done
+#[[ $SECONDS -gt 10 ]] && logger -t gpumem "GPU memory check took ${SECONDS} seconds"
+# End of GPU Used Memory checks
+
+exit 0

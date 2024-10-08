@@ -1,0 +1,16 @@
+#!/bin/bash
+
+#verbose Checking memory
+### TODO: map into MI300X nodes
+
+#compare_ge $(awk '/MemTotal/ {print $2}' /proc/meminfo) 520000000 "Total memory"
+#compare_ge $(awk '/MemAvailable/ {print $2}' /proc/meminfo) 460000000 "Available memory"
+#compare "$(awk '$2 == "/dev/hugepages" {print $3}' /proc/self/mounts)" "hugetlbfs" "/dev/hugepages is not mounted"
+#DMIMEM=$(/usr/sbin/dmidecode --type memory)
+#compare $(echo "$DMIMEM" | grep Manufacturer: | sort -u | wc -l) 1 "Number of memory manufacturers"
+#compare $(echo "$DMIMEM" | egrep ^[[:space:]]Size: | sort -u | wc -l) 1 "DIMM sizes"
+#compare $(echo "$DMIMEM" | egrep ^[[:space:]]Speed: | sort -u | wc -l) 1 "DIMM speeds"
+#compare $(echo "$DMIMEM" | awk '/Number Of Devices/ {print $4}') 8 "Count of DIMMs"
+
+
+exit 0

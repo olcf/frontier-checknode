@@ -1,0 +1,11 @@
+#!/bin/bash
+# check_running_jobs.sh: if there are no running jobs via slurm, then 
+# print and return a 0.  Otherwise, print and return a 1.
+
+
+result=1 # assume a running job
+if ( `scontrol listpids 2>&1 | grep -q "No job steps" ` ); then
+ result=0 # no running jobs found via slurm
+fi
+echo $result
+exit $result
