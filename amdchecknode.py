@@ -1,271 +1,304 @@
 #!/usr/bin/env -S python3
 
+# Derived from the ORNL checknode script (bash).  Converted to python,
+# modularized, added error checks, signal handling, etc.
+# 
+
+# This software is Apache 2.0 licensed 
+# Copyright 2024 AMD
+
+# Please see the included LICENSE file for details.
+
+#
+# Original developers @ ORNL: Matt Ezell, Nick Hegarty
+# Python rewrite @ AMD: Joe Landman, Ken Wright, Vishal Singh
+#
+
+import argparse as ap
+import os
+from pathlib import Path
+import re
+import signal
 import subprocess as sp
+import time
 
-#
-# Boot-time and run-time diagnostics
-# Checks for the presence/health of various components
-# Undrain node up if it is healthy
-#
-
-usage() {
-    echo "Usage: $0 [-a] [-b] [-c] [-h] [-l] [-r] [-u] [-v]"
-    echo "  -a all mode - run all tests"
-    echo "  -b boot mode - mark the boot sequence as complete"
-    echo "  -c check node only - do not change Slurm state"
-    echo "  -h print this help message"
-    echo "  -l local checks only - avoid network-dependent checks"
-    echo "  -r manually run node screen after failure"
-    echo "  -u force undrain - clear hand-set drain messages"
-    echo "  -v verbose mode"
-    echo ""
-}
+t_start = time.time()
 
 
-trap "rm -f /run/checknode/lock" EXIT
-
-if [[ -e /run/checknode/lock ]]; then
-    echo "Checknode lock already in place"
-    logger -t checknode "Checknode lock already in place"
-    exit 1
-fi
-
-ALL=0
-BOOT=0
-CHECKONLY=0
-LOCALONLY=0
-ERRORCNT=0
+SLURM_CONF="/etc/slurm/slurm.conf"
+topdir = "/run/checknode"
+ALL=False
+BOOT=False
+CHECKONLY=False
+LOCALONLY=False
+ERRORCNT=False
 ERRORSTR=''
-UNDRAIN=0
-VERBOSE=0
-MANUALNODESCREEN=0
-export SLURM_CONF=/etc/slurm/slurm.conf.min
-mkdir -p /run/checknode
-mkdir -p /run/checknode/journalcache
-touch /run/checknode/lock
-echo "running" > /run/checknode/state
-echo -n > /run/checknode/log
-[ -L /root/checknode_state ] || ln -sf /run/checknode/state /root/checknode_state
-[ -L /root/checknode_log ] || ln -sf /run/checknode/log /root/checknode_log
+UNDRAIN=False
+VERBOSE=False
+MANUALNODESCREEN=False
+DRYRUN=False
+TESTDIR=''
+
+
+
+# set up signal handlers so as to do the right thing
+# if we catch specific signals
+def sig_handler_setup():
+   # handle all the signals that will terminate this
+   # and send an error to slurm
+   signal.signal(signal.SIGQUIT,sigexits)
+   signal.signal(signal.SIGINT,sigexits)
+   signal.signal(signal.SIGTRAP,sigexits)
+   signal.signal(signal.SIGABRT,sigexits)
+   signal.signal(signal.SIGALRM,sigexits)
+   signal.signal(signal.SIGBUS,sigexits)
+
+   # handle all the signals that will not terminate this
+   signal.signal(signal.SIGFPE,sigwarns)
+   signal.signal(signal.SIGUSR1,sigwarns)
+   signal.signal(signal.SIGUSR2,sigwarns)
+   signal.signal(signal.SIGSEGV,sigwarns)
+   signal.signal(signal.SIGPIPE,sigwarns)
+   signal.signal(signal.SIGCHLD,sigwarns)
+   
+def sigexits(number,frame):
+   print(f"""TERMINAL SIGNAL number {number} caught\n{frame} """)
+   # send stuff to slurm
+
+   # remove the lock file
+   os.unlink("/run/checknode/lock")
+   exit(1)
+
+def sigwarns(number,frame):
+   print(f"""NONTERMINAL SIGNAL number {number} caught\n{frame} """)
+   # dont send stuff to slurm
+
+#
+# Find top level tests directory.  In order, look for
+#  1) command line arguments (--testdir=/path/to/testdir
+#      --config=/path/to/config --slurm=/path/to/slurm)
+#  1) environment variable AMDCHECKNODEDIR
+#  2) /etc/amdchecknode.conf
+#  3) $HOME/.config/amdchecknode.conf
+#  4) current directory amdnodecheck.conf
+#
+#  In the environment variable case, this will point to a directory with an amdchecknode.conf
+#  file.
+#  
+#  Structure of amdchecknode.conf file are simple key value pairs.
+# 
+#  Mandatory keys
+#
+#  key               type           value 
+#  TESTDIR           string         path to amdchecknode tests directory
+#  SLURM_CONF        string         path to slurm.conf
+#
+#  Optional keys
+#
+#  VERBOSE           integer        1 == true, 0 == false
+
+
+def find_and_read_config(fname=''):
+   global TESTDIR, SLURM_CONF, VERBOSE, DRYRUN
+   if fname == None:
+      fname=''
+
+   # look for AMDCHECKNODEDIR
+   if (fname == '') & os.environ.get('AMDCHECKNODEDIR',False):
+      fname=os.environ.get('AMDCHECKNODEDIR')
+   
+   # look for /etc/amdchecknode.conf
+   if (fname == '') & exists('/etc/amdchecknode.conf'):
+      fname='/etc/amdchecknode.conf'
+   
+   # look for $HOME/.config/amdchecknode.conf
+   if (fname == '') & exists(os.getenv('HOME') + '/.config/amdchecknode.conf'):
+      fname=os.getenv('HOME') + '/.config/amdchecknode.conf'
+   
+   # look for current directory amdchecknode.conf
+   if (fname == '') & exists(os.getcwd() + '/amdchecknode.conf'):
+      fname=os.getcwd() + '/amdchecknode.conf'
+
+   # if we still don't have a file name (fname) for the config,
+   # print an error, and exit with 1
+   if fname == '':
+      print("Error: unable to find amdchecknode.conf\n")
+      exit(1)
+   
+   with open(fname,"r") as f:
+      lines=f.readlines()
+   
+   # minimal parser, pounds are comments, and only look at material to the 
+   # left of them.  Skip blank lines
+   for l in lines:
+      kvp=l.split("#")[0].rstrip()
+      if kvp == '':
+         continue # ignore blank lines
+      
+      kvp_l = kvp.split('=')
+      if kvp_l[0] == 'TESTDIR':
+         TESTDIR=kvp_l[1]
+      
+      if kvp_l[0] == 'SLURM_CONF':
+         SLURM_CONF=kvp_l[1]
+      
+      if kvp_l[0] == 'VERBOSE':
+         if kvp_l[1] == 0:
+            VERBOSE=False
+         else:
+            VERBOSE=True
+         
+      if kvp_l[0] == 'DRYRUN':
+         if kvp_l[1] == 0:
+            DRYRUN=False
+         else:
+            DRYRUN=True
+         
+
+def command_line_options():
+   p = ap.ArgumentParser( 
+      prog='amdchecknode',
+      description='Amdchecknode runs tests to verify node health before a scheduler based job launch'
+   )
+   #p.add_argument('-a', '--all', action='store_true', help="run all tests")
+   p.add_argument('-b', '--boot-mode', action='store_true', help="boot mode")
+   #p.add_argument('-c', '--check-node-only', action='store_true', help="check node only")
+   #p.add_argument('-l', '--local-checks-only', action='store_true', help="local checks only")
+   #p.add_argument('-r', '--node-screen', action='store_true', help="run node screen")
+   p.add_argument('-u', '--force-undrain', action='store_true',help="force slurm undrain")
+   p.add_argument('-v', '--verbose', action='store_true', help="force verbose")
+   p.add_argument('--testdir', help="set test directory")
+   p.add_argument('--config', help="set config directory")
+   p.add_argument('--slurm', help="set slurm directory")
+   #p.add_argument('--parallel', help="run tests in parallel (defaults to serial)")
+   #p.add_argument('--timeout', help="timeout in seconds for entire script to complete")
+   p.add_argument('--dryrun', action='store_true',help="print test names that would be run without running them")
+   args = p.parse_args()
+   return args
+ 
+def exists(path):
+   p = Path(path)
+   return p.exists()
+
+def mkdir(path):
+   p = Path(path)
+   result = False
+   try:
+      result = p.mkdir(parents=True,exist_ok=True)
+   except:
+      pass
+   return result
+
+def touch(path):
+   p = Path(path)
+   result = False
+   try:
+      result = p.touch(exist_ok=True)
+   except:
+      pass
+   return result
+
+def check_if_running():
+   if exists("/run/checknode/lock"):
+      if VERBOSE: print("amdchecknode lock in place, amdchecknode is running")
+      return True
+   return False
+
+def prepare_run_directory():
+   return mkdir(topdir)
+
+def set(path,content):
+   p = Path(path)
+   result = False
+   try:
+      result = p.open("w").write(content)
+   except:
+      pass
+   return result
+
+def run(cmdstr,timeout=60):
+   # run a command, return a return code, stdout, and stderr
+   # if thgere is an error running the command, return None, and two blank strings
+   try:
+      s = sp.run(cmdstr,
+                  capture_output=True,
+                  shell=True,
+                  universal_newlines=True,
+                  timeout=timeout
+      )
+   except:
+      return (None,"","")
+   
+   return (s.returncode, s.stdout, s.stderr)
+
+#
+# begin
+#
+
+
+
+args = command_line_options()
+find_and_read_config(fname=args.config)
+
+check_if_running()
+if prepare_run_directory() == False:
+   if VERBOSE: print(f"Unable to create {topdir}")
+   exit(1)
+
+mkdir("/run/checknode/journalcache")
+touch("/run/checknode/lock")
+if set("/run/checknode/state","running") == False:
+   print(f"Unable to create /run/checknode/state ")
+   exit(1)
 
 ###############################################################################
 # Process arguments
 ###############################################################################
-while getopts "abchlruv" option; do
-    case $option in
-        a ) ALL=1
-            LOCALONLY=0
-            ;;
-        b ) BOOT=1
-            ;;
-        c ) CHECKONLY=1
-            ;;
-        l ) LOCALONLY=1
-            SLURM_OK=0
-            ;;
-        h ) usage
-            exit 1
-            ;;
-        r ) MANUALNODESCREEN=1
-            ;;
-        u ) UNDRAIN=1
-            ;;
-        v ) VERBOSE=1
-            ;;
-        \? ) usage
-            exit 1
-            ;;
-        * ) echo "Option $option not understood"
-            usage
-            exit 1
-            ;;
-    esac
-done
 
-[ $BOOT -eq 1 ] && touch /run/checknode/booted
+if BOOT:
+   touch("/run/checknode/booted")
+else:
+   # sanity check boot status
+   if re.match(r"No jobs running",run('systemctl list-jobs')[1]):
+      BOOT=1
+      touch("/run/checknode/booted")
+   else:
+      if VERBOSE: print("Node is still booting\n")
+      exit(1)
 
-if [ $BOOT -eq 0 ]; then
-  # sanity check boot status
-  if ( systemctl list-jobs | grep -q "No jobs running." ); then
-    BOOT=1
-    touch /run/checknode/booted
-  else
-    echo "Node is still booting"
-    exit 1
-  fi
-fi
 
 ################################################################################
-# checks: return a 0 on success, and 1 on failure
+# tests: return a 0 on success, and non-zero on failure
 ################################################################################
 
-# Check for running jobs
-tests/check_for_running_jobs.sh && RUNNINGJOB=1 || RUNNINGJOB=0
+test_list = os.listdir(TESTDIR)
+test_list.sort()
+tests = {}
 
-HOST=$(hostname)
-. includes/functions.sh
+TIMEOUT=10
 
+# run them in serial for now
+for test in test_list:
+   testname = TESTDIR + '/' + test
+   if VERBOSE: print(f"test = {test}, file = {testname}")
+   if args.dryrun:
+      print(" ... Dry run, not actually running this code\n")
+   else:
+      if VERBOSE: print(f" Beginning run of {test}")
+      t_initial = time.time()
+      ret = run(testname,timeout=TIMEOUT)
+      t_final = time.time()
+      dt = t_final - t_initial
+      to = False
+      if dt >= TIMEOUT:
+         to = True
+      tests[test] = {'name': test, 
+                     'runtime': t_final-t_initial, 
+                     'stderr': ret[2],
+                     'stdout': ret[1],
+                     'returncode': ret[0],
+                     'timed_out': to
+                     }
+      if VERBOSE: print(f" End of run {test}\n delta t = {t_final-t_initial:.3f}\n return code = {ret[0]}\n stderr = {ret[2]}\n stdout = {ret[1]}\n")
 
-###############################################################################
-# Check if nodescreen is currently running
-###############################################################################
-if [[ -e /run/nodescreen/lock ]]; then
-    diaginfo "/run/nodescreen/lock in place. Node is currently running nodescreen."
-    exit 1
-fi
-
-
-###############################################################################
-# Generic checks
-###############################################################################
-tests/generic_checks
-
-
-###############################################################################
-# Firmware checks
-###############################################################################
-tests/firmware_checks
-
-
-###############################################################################
-# Process checks
-###############################################################################
-tests/process_checks
-
-
-###############################################################################
-# Early GPU checks - so the Slurm drain reason becomes this
-###############################################################################
-### TODO: map for MI300X
-tests/early_gpu_checks
-
-
-###############################################################################
-# Stray User Process Check
-###############################################################################
-tests/stray_user_process_checks
-
-
-###############################################################################
-# Flush caches
-###############################################################################
-functions/flush_caches
-
-
-###############################################################################
-# CPU Checks
-###############################################################################
-tests/cpu_checks
-
-
-###############################################################################
-# HSN checks
-###############################################################################
-tests/hsn_checks
-
-
-###############################################################################
-# GPU checks
-###############################################################################
-tests/gpu_checks
-
-
-###############################################################################
-# Boot Error Checks
-###############################################################################
-tests/boot_error_checks
-
-###############################################################################
-# NVME Health Checks
-###############################################################################
-tests/nvme_health_checks
-
-###############################################################################
-# File System Checks
-###############################################################################
-tests/file_system_checks
-
-###############################################################################
-# Host Memory Checks
-###############################################################################
-verbose Checking memory
-### TODO: map into MI300X nodes
-
-#compare_ge $(awk '/MemTotal/ {print $2}' /proc/meminfo) 520000000 "Total memory"
-#compare_ge $(awk '/MemAvailable/ {print $2}' /proc/meminfo) 460000000 "Available memory"
-#compare "$(awk '$2 == "/dev/hugepages" {print $3}' /proc/self/mounts)" "hugetlbfs" "/dev/hugepages is not mounted"
-#DMIMEM=$(/usr/sbin/dmidecode --type memory)
-#compare $(echo "$DMIMEM" | grep Manufacturer: | sort -u | wc -l) 1 "Number of memory manufacturers"
-#compare $(echo "$DMIMEM" | egrep ^[[:space:]]Size: | sort -u | wc -l) 1 "DIMM sizes"
-#compare $(echo "$DMIMEM" | egrep ^[[:space:]]Speed: | sort -u | wc -l) 1 "DIMM speeds"
-#compare $(echo "$DMIMEM" | awk '/Number Of Devices/ {print $4}') 8 "Count of DIMMs"
-
-
-###############################################################################
-# State Updates
-###############################################################################
-
-if [ $ERRORCNT -gt 0 ]; then
-  readslurmstate
-  echo "fail" > /run/checknode/state
-  ERRORSTR2="checknode($ERRORCNT) $(echo "$ERRORSTR"|tr '\n' ';')"
-  if [[ $CHECKONLY -eq 1 ]]; then
-    logstderr "Node is unhealthy - checkonly mode"
-  elif [[ "$CURRENTREASON" == "$ERRORSTR2" ]]; then
-    logstderr "Node is unhealthy - reason unchanged"
-  elif [[ "$CURRENTREASON" != "checknode"* &&
-          "$CURRENTREASON" != "Kill task failed" &&
-          "$CURRENTREASON" != "Not responding" &&
-          "$CURRENTREASON" != "Prolog error" &&
-          "$CURRENTREASON" != "Epilog error" &&
-          "$CURRENTREASON" != "SPI job"* &&
-          "$CURRENTREASON" != "switch_g_job_postfini failed" &&
-          "$CURRENTREASON" != "none" &&
-          "$CURRENTREASON" != ""
-          ]]; then
-    logstderr "Node is unhealthy - not changing existing reason: $CURRENTREASON"
-  else
-    [ $SLURM_OK -eq 1 ] && logstderr "Node is unhealthy - marking drain"
-    [ $SLURM_OK -eq 1 ] && scontrol --local update node=$(hostname) state=drain reason="$ERRORSTR2" > /dev/null
-  fi
-  if [[ "$ERRORSTR" == *"hsn"* ]] ; then
-    logstderr "Stopping slurmd due to hsn errors"
-    stopslurmd
-  else
-    startslurmd
-  fi
-  exit 1
-fi
-
-# If this is initial startup, slurmd might not be running
-startslurmd
-readslurmstate
-
-# If we made it here, the node is healthy
-echo "pass" > /run/checknode/state
-# If there's an existing comment in checkonly mode (not rebooting), leave the node down
-if [[ $CHECKONLY -eq 1 ||
-     "$CURRENTSTATE" == "idle" ||
-     "$CURRENTSTATE" == "plnd" ||
-     "$CURRENTSTATE" == "maint" ||
-     "$CURRENTSTATE" == "resv"
-     ]]; then
-  logstdout "Node is healthy - not changing state from $CURRENTSTATE"
-elif [[ "$CURRENTREASON" == "Node unexpectedly rebooted" && $UNDRAIN -eq 0 ]]; then
-  logstdout "Node is healthy - NOT clearing unexpected reboot - use 'checknode -u' to clear IF you understand the reboot reason"
-elif [[ "$CURRENTREASON" != "checknode"* &&
-        "$CURRENTREASON" != "Kill task failed" &&
-        "$CURRENTREASON" != "Not responding" &&
-        "$CURRENTREASON" != "SPI job"* &&
-        "$CURRENTREASON" != "switch_g_job_postfini failed" &&
-        "$CURRENTREASON" != "none" &&
-        $UNDRAIN -eq 0
-        ]]; then
-  logstderr "Node is healthy - not changing existing reason: '$CURRENTREASON' - use 'checknode -u' to clear IF you know it is safe to clear"
-else
-  [ $SLURM_OK -eq 1 ] && logstdout "Node is healthy - marking online" || echo "Node is healthy - not contacting slurm"
-  [ $SLURM_OK -eq 1 ] && scontrol --local update node=$(hostname) state=idle > /dev/null
-fi
-
-exit 0
-# vim: ai:ts=2:sw=2:syn=sh
+   

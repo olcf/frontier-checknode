@@ -1,0 +1,18 @@
+#!/bin/bash -x
+
+# use a fixed ROCMPATH 
+#
+TOPDIR=/opt/rocm
+BINDIR=${TOPDIR}/bin
+
+# this is where the rvs tests are stored
+CONFDIR=${TOPDIR}/share/rocm-validation-suite/conf
+
+# this will point to a specific RVS config file.
+TEST=${CONFDIR}/mem.conf
+
+# OPTIONS: for the RVS run
+OPTIONS=-v
+
+# now run the test
+${BINDIR}/rvs ${OPTIONS} -c ${TEST}
