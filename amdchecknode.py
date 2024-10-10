@@ -19,6 +19,7 @@ import os
 from pathlib import Path
 import re
 import signal
+import socket
 import subprocess as sp
 import time
 
@@ -38,7 +39,8 @@ VERBOSE=False
 MANUALNODESCREEN=False
 DRYRUN=False
 TESTDIR=''
-
+REDFISHPROXYSERVER='http://rps/'
+TIMEOUT=10
 
 
 # set up signal handlers so as to do the right thing
@@ -96,10 +98,11 @@ def sigwarns(number,frame):
 #  Optional keys
 #
 #  VERBOSE           integer        1 == true, 0 == false
+#  REDFISHPROXYSERVER string        http(s)://URL_TO_REDFISH_PROXY_SERVER/
 
 
 def find_and_read_config(fname=''):
-   global TESTDIR, SLURM_CONF, VERBOSE, DRYRUN
+   global TESTDIR, SLURM_CONF, VERBOSE, DRYRUN, REDFISHPROXYSERVER, TIMEOUT
    if fname == None:
       fname=''
 
@@ -141,7 +144,13 @@ def find_and_read_config(fname=''):
       
       if kvp_l[0] == 'SLURM_CONF':
          SLURM_CONF=kvp_l[1]
-      
+
+      if kvp_l[0] == 'REDFISHPROXYSERVER':
+         REDFISHPROXYSERVER=kvp_l[1]
+
+      if kvp_l[0] == 'TIMEOUT':
+         TIMEOUT=kvp_l[1]
+    
       if kvp_l[0] == 'VERBOSE':
          if kvp_l[1] == 0:
             VERBOSE=False
@@ -173,6 +182,7 @@ def command_line_options():
    #p.add_argument('--parallel', help="run tests in parallel (defaults to serial)")
    #p.add_argument('--timeout', help="timeout in seconds for entire script to complete")
    p.add_argument('--dryrun', action='store_true',help="print test names that would be run without running them")
+   p.add_argument('--redfish-proxy', help="set redfish proxy server")
    args = p.parse_args()
    return args
  
@@ -231,6 +241,20 @@ def run(cmdstr,timeout=60):
    
    return (s.returncode, s.stdout, s.stderr)
 
+def send_failure_notification():
+   # this is where we send either a RedFish event,
+   # or something similar
+   pass
+
+def send_redfish_event_to_proxy(problem='',test=''):
+   # Note that this will need to go through a proxy to ensure
+   # that BMC user IDs and passwords are not leaked.
+
+   hname = socket.gethostname()
+
+   cmd = f"curl -k -X POST {REDFISHPROXYSERVER}/Event -F hostname={hname} -F problem={problem} test={test}"  
+
+
 #
 # begin
 #
@@ -275,7 +299,7 @@ test_list = os.listdir(TESTDIR)
 test_list.sort()
 tests = {}
 
-TIMEOUT=10
+
 
 # run them in serial for now
 for test in test_list:
